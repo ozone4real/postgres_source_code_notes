@@ -1,0 +1,92 @@
+PageHeaderData {
+	pd_lsn; # next byte after last byte of WAL record for last change to this page
+	pd_checksum; # checksum of page
+	pd_flags; # flags for page
+	pd_lower; # offset to start of free space. Freespace is the space betwen the last allocated line pointer and the last tuple in the page.
+	pd_upper; # offset to end of free space
+	pd_special; # offset to start of special space
+	pd_pagesize_version; # page size and version
+	pd_prune_xid; # oldest prunable XID, or zero if none
+}
+
+# line pointer (pointer to a specific tuple in a page) i.e it's offset from the start of the page and length. After the page header,
+# there is an array of ItemIdData structures, one for each tuple in the page.
+ItemIdData {
+  	unsigned	lp_off:15,		/* offset to tuple (from start of page) */
+				lp_flags:2,		/* state of line pointer, see below */
+				lp_len:15;		/* byte length of tuple */
+}
+
+# Structure of the row/tuple
+HeapTupleHeaderData {
+  
+}
+
+# Pointer to tuple data in table (from an index tuple for example)
+ * ip_blkid tells us which block, ip_posid tells us which entry in
+ * the linp (ItemIdData) array we want.
+ItemPointerData
+{
+	BlockIdData ip_blkid;
+	OffsetNumber ip_posid;
+}
+
+PageInit()
+
+
+# Summary of PageAddItemExtended() (buffpage.c)
+# This is responsible for adding a new item (tuple) to a page in the shared memory buffer. It takes the following arguments:
+# 1. page: The page to add the item to
+# 2. item: The item to add
+# 3. size: The size of the item
+# 4. offsetNumber: The offset number to use for the new item
+
+# If offsetNumber is set to InvalidOffsetNumber, the function will find a free(unused) offset number (line pointer AKA itemId) to use for the new item.
+# or allocate a new one after the last one in the page (if there is space for it, i.e  new offsetNumber < MaxHeapTuplesPerPage), it will then add the item to the page (with memcpy) at that offsetNumber.
+# If offsetNumber is valid (i.e not InvalidOffsetNumber), the function will use that offset number to add the item to the page only if the itemId at that
+# offsetNumber is not in use (i.e lp_flags is set to LP_UNUSED). If the itemId is in use, the function will return InvalidOffsetNumber.
+
+
+
+# Currently reading heapam.c, trying to understand BufferGetPage()
+
+
+
+
+
+
+/*
+ * The overall layout of an XLOG record is:
+ *		Fixed-size header (XLogRecord struct)
+ *		XLogRecordBlockHeader struct
+ *		XLogRecordBlockHeader struct
+ *		...
+ *		XLogRecordDataHeader[Short|Long] struct
+ *		block data
+ *		block data
+ *		...
+ *		main data
+ *
+ * There can be zero or more XLogRecordBlockHeaders, and 0 or more bytes of
+ * rmgr-specific data not associated with a block.  XLogRecord structs
+ * always start on MAXALIGN boundaries in the WAL files, but the rest of
+ * the fields are not aligned.
+ *
+ * The XLogRecordBlockHeader, XLogRecordDataHeaderShort and
+ * XLogRecordDataHeaderLong structs all begin with a single 'id' byte. It's
+ * used to distinguish between block references, and the main data structs.
+ */
+typedef struct XLogRecord
+{
+	uint32		xl_tot_len;		/* total len of entire record */
+	TransactionId xl_xid;		/* xact id */
+	XLogRecPtr	xl_prev;		/* ptr to previous record in log */
+	uint8		xl_info;		/* flag bits, see below */
+	RmgrId		xl_rmid;		/* resource manager for this record */
+	/* 2 bytes of padding here, initialize to zero */
+	pg_crc32c	xl_crc;			/* CRC for this record */
+
+	/* XLogRecordBlockHeaders and XLogRecordDataHeader follow, no padding */
+
+} XLogRecord;
+

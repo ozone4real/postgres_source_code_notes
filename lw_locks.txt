@@ -1,0 +1,183 @@
+### LW LOCKS
+
+Light weight locks is the main mutual exclusion mechanism used by Postgres. It has less overhead compared to the POSIX-semaphore based spinlock
+
+Functions:
+
+InitializeLWLocks()
+
+Initializes shared LW Locks in a MainLWLockArray structure in shared memory region. 
+There are 2 types of LW locks: Individual locks and named locks. 
+Locks are grouped by their categories using a tranche_id (categories are called tranches). So each individual and named lock is a category.
+
+- Individual locks: Includes transaction management locks, WALwrite lock, Autovacuum locks, TransactionId generation locks, etc.
+
+Named locks
+The following built-in named locks are initialized by the InitializeLWLocks() function:
+- Buffer mapping lock(tranche_id: LWTRANCHE_BUFFER_MAPPING): Protects the mapping between buffer tags and buffer ids (the index of the table page in the buffer)
+- Lock manager locks(tranche_id: LWTRANCHE_LOCK_MANAGER) : Used to protect the lock manager's data structures
+- Lock manager predicate locks(tranche_id: LWTRANCHE_PREDICATE_LOCK_MANAGER)
+The above individual and named locks are fixed, so their tranche info (id and name) are static/hard-coded.
+There are also other built-in named locks that are only initialized optionally, so they're not part of the initial initizlization or the MainLWLockArray (perhaps they aren't also shared).
+All built-in named tranches can be found in lwlock.h
+
+Apart from built-in named locks, shared named LWLocks can also be requested by user (i.e extensions) and allocated dynamically in the MainLWLockArray.
+The locks are initialized after the fixed locks and assigned new tranche_ids with LWLockNewTrancheId() and the tranche info (name and id) are saved
+in shared memory after all the locks (both fixed and named).
+
+LWLockInitialize()
+Initializes a new LWLock, with the initial state unlocked
+
+Structure of a LWLock
+
+{
+	uint16		tranche;		/* tranche ID */
+	pg_atomic_uint32 state;		/* state of exclusive/nonexclusive lockers */
+	proclist_head waiters;
+}
+structure of the pg_atomic_uint32 value struct:
+{
+	int sema; /* for atomic access to value */
+	volatile uint32 value;
+}
+
+
+LWLockAttemptLock(LWLock * lock, LWLockMode mode)
+Arguments:
+- lock: The lock to acquire
+- mode: The mode to acquire the lock in. It can be either LW_EXCLUSIVE or LW_SHARED
+
+This function attempts to acquire a lock. It returns false if it acquired the lock and true if it didn't. No waiting is involved.
+How does it do this?
+1. It caches the current state of the lock in a variable (old_state)
+Then the following is done in a loop:
+2. If the current lock state (lock->state) doesn't conflict with the mode, it sets another variable (desired_state) to the new state of mode. 
+E.g if  mode is exclusive and lock->state is free, the new variable is set. If mode is shared and lock->state is not exclusive,
+the variable is set. Any other condition means conflict between existing lock mode(lock->state) and requested lock mode (mode argument)
+3. It then does an atomic compare and exchange using the relevant assembly code for the computer architecture. The compare and exchange function takes 3 arguments:
+A pointer to the value (a pg_atomic_uint32 type) of the subject (lock->state), a pointer to the value to compare with the subject (old_state), the value to replace the subject with.
+If lock->state and old_state are the same, lock->state is replaced with desired_state and returns true if the values were exchanged, else it returns false.
+4. if the atomic comp and exch returned a success, and the desired_state variable was set, the function returns false (i.e lock acquired), if the desired state wasn't set,
+it means the comp and exch didn't really change anything despite returning a success, so the function returns true (i.e lock couldn't be acquired). If the atomic comp
+and exch wasn't successful, i.e no exchange occured because lock->state and old_state was different (due to another process changing the state in between the cache (i.e operation 1) and comp and exchange),
+then the loop repeats.
+
+LWLockAcquire(LWLock *lock, LWLockMode mode)
+1. If num_held_lwlocks > MAX_SIMUL_LWLOCKS (200), an exception is raised.
+2. In a continous loop, it tries to acquire the lock with LWLockAttemptLock()
+3. If LWLockAttemptLock() returns false (i.e the lock was acquired successfully), the loop is exited immediately.
+4. If LWLockAttemptLock() returns true (i.e the lock wasn't acquired), it adds itself to the lock's waiters queue (lock->waiters) using the
+LWLockQueueSelf(lock) function (I'll explain how this function works later), it then tries again to acquire the lock using LWLockAttemptLock(), if successful the
+it dequeues itself from the lock->waiters queue using LWLockDequeueSelf(lock) and the loop is exited immediately. If the LWLockAttemptLock() reattempt failed,
+the process is put to sleep using PGSemaphoreLock(). When woken up, it checks if the wakeup was due to the lock's release
+by checking proc->lwWaiting == LW_WS_NOT_WAITING, if that is false, it goes back to sleep in a loop until the wakeup is due to a lock release.
+5. After waking up due to a lock's release, it sets the  LW_FLAG_RELEASE_OK on lock->state atomically and then the loop iterates again
+from operation 2: reattempting to acquire the lock. The LW_FLAG_RELEASE_OK flag serves as the default state when a new lwlock is initialized. It's
+also set by a processes each time an attempt to acquire a lock fails. The flag signals to the process holding the lock that after it has released the lock,
+it's safe to wakeup waiting processes (i.e processes in the lock->waiters list)
+5. After the lock is successfully acquired at any point of the flow described above, the loop is exited and the held_lwlocks array is updated
+with the lock and the lock mode.
+
+
+### How atomic operations (e.g compare and exchange) are implemented 
+Atomic operations are implemented using the pg_atomic_compare_exchange_u32_impl functions, there is a default one and one for each CPU architecture.
+The functions take 3 arguments as mentioned previously.
+Default implementation
+The default one is implemented as follows:
+- The subject (a pg_atomic_uint32 type)'s semaphore is locked (i.e decremented) using a SpinLock
+- The value to compare (2nd argument) is compared with the subject's value and the comparison result(boolean) is stored in a variable.
+- If they are equal, the subject's value is set to the 3rd argument
+- The SpinLock is released (more on SpinLocks later).
+- The function returns the result of the comparison (i.e the variable it was stored previously).
+
+CPU architecture-dependent implementation
+- This is done with a compxchng instruction in assembly. To make it atomic the instruction is prefixed with `lock`
+
+### How the atomic compare and exchange functions are used
+- In a loop, the subject's value is cached in a pointer
+- The subject's value, cached value and the desired value are passed to the atomic compare and exchange function as arguments.
+- If the atomic compare and exchange was successful, i.e if the subject's value is still the same as cached value,
+the loop is exited
+- If the subject's value has changed and no longer equal to the cached value the loop continues until the previous condition is met and the loop exits.
+
+LockHandle struct
+{
+	LWLock lock,
+	LWLockMode mode,
+}
+
+LWLockRelease(LWLock * lock)
+- It finds the lock in the process' held_lwlocks array (btw the held_lwlocks array is an array of LockHandles (see structure above)).
+- If the lock wasn't found, it raises a "lock not held" error.
+- It then decrements the num_held_lwlocks and removes the lock from the held_lwlocks array.
+- It then unsets the lock flag from lock->state based on the mode (e.g if mode is LW_EXCLUSIVE it unsets LW_VAL_EXCLUSIVE)
+- If lock->state has the LW_FLAG_RELEASE_OK and LW_FLAG_HAS_WAITERS, it wakes up the waiting processes (lock->waiters) with LWLockWakeUp()
+
+typedef struct proclist_node
+{
+	int next; /* pgprocno of the next PGPROC */
+	int prev; /* pgprocno of the prev PGPROC */
+} proclist_node;
+
+typedef struct proclist_head
+{
+	int head; /* pgprocno of the head PGPROC */
+	int tail; /* pgprocno of the tail PGPROC */
+} proclist_head;
+
+typedef struct proclist_mutable_iter
+{
+	int cur;	/* pgprocno of the current PGPROC */
+	int next; /* pgprocno of the next PGPROC */
+} proclist_mutable_iter;
+
+lock->waiters is a doubly linked list (proclist_head) of pgprocno (i.e pg-specific process ids of global processses). The linked list is traversed by:
+- From the head, get the process struc (PGPROC) associated with the pgprocno. There is a GetPGProcByNumber function to get the process(PGPROC) associated
+with the pgprocno, the link to the next node is in the lwWaitLink member of the (PGPROC) struct, the link is a linked list node (proclist_node, see struct above),
+so the next node is essentially GetPGProcByNumber->lwWaitLink->next (there is a proclist_node_get function that wraps this logic),
+each link is followed until the tail of the list i.e proclist_node->next == INVALID_PGPROCNO
+- If the list head == INVALID_PGPROCNO, it means the list is empty, if a node points to INVALID_PGPROCNO, it means it's tail of the linked list,
+which ends any traversal
+
+LWLockWakeUp(LWLock * lock)
+1. The lock's wait list is locked with LWLockWaitListLock() - This sets the LW_FLAG_LOCKED flag on lock->state
+2. Loop through each waiter (lock->waiters)
+3. If the current waiter's lwWaitMode (i.e the mode of lock it's trying to acquire) is LW_EXCLUSIVE and the wokeup_somebody variable was set
+in the previous iteration, skip to the next iteration of the loop (with continue), this is because the waiter scheduled to be woken up in the previous iteration
+was waiting on a LW_SHARED mode (if it was an LW_EXCLUSIVE mode, the loop would've been exited, more on this later) and once a LW_SHARED waiter
+is scheduled to be woken up, only LW_SHARED waiters will be scheduled to be woken up this is obviously because LW_SHARED and LW_EXCLUSIVE conflict and LW_SHARED lock can be
+held by multiple processes simultaneously. On the other hand the loop is exited immediately a LW_EXCLUSIVE waiter is scheduled for wakup because an
+exclusive lock can only be held by 1 process.
+4. If the main check in step 3 is false (i.e if the iteration wasn't skipped), the waiter for the current iteration is deleted from the 
+lock->waiters proclist and added to the tail of a local proclist variable (named wakeup) which is a list of waiters that will be woken up.
+5. If the waiter->lwWaitMode != LW_WAIT_UNTIL_FREE, wokeup_somebody is set to true and new_release_ok is set to false
+6. waiter->lwWaiting is set to LW_WS_PENDING_WAKEUP
+7. If the waiter->lwWaitMode is LW_EXCLUSIVE the loop exits. Just as I mentioned in point 3.
+8. After the loop exits either due to a break (due to an LW_EXCLUSIVE waiter scheduled for wakeup) or reaching the end of the loop with all LW_SHARED waiters
+scheduled in the wakup list for wake up, using an atomic compare and exchange operation, the lock's state is updated by adding or removing the LW_FLAG_RELEASE_OK flag based on the
+new_release_ok variable, the lock's LW_FLAG_LOCKED flag is removed (remember it was set in step 1) and if there were no waiters to wakeup (i.e the)
+wakeup proclist is empty, the LW_FLAG_HAS_WAITERS flag is unset too.
+9. The wakeup proclist is iterated and each waiter is woken up for real by setting waiter->lwWaiting to LW_WS_NOT_WAITING and waking up with
+PGSemaphoreUnlock(). This is done witha write_barrier to ensure all previous operations are written to shared memory before the actual wakeups.
+
+LWLockQueueSelf(LWLock * lock, LWLockMode mode)
+1. If MyProc is null (i.e there is no PGPROC structure for the process), an exception is raised
+2. If MyProc->lwWaiting  isn't LW_WS_NOT_WAITING (i.e if the process is already waiting for a lock), an exception is raised.
+3. The lock's wait list is locked with LWLockWaitListLock() - This sets the LW_FLAG_LOCKED flag on lock->state
+4. The LW_FLAG_HAS_WAITERS flag is set on lock->state atomically
+5. The current process' lwWaiting is set to LW_WS_WAITING, lwWaitMode is set to the lock mode the process is tryna acquire
+5. The current process is added to lock->waiters proclist
+6. The lock's wait list is unlocked with LWLockWaitListUnLock()
+
+LWLockDequeueSelf(LWLock * lock)
+This is used to dequeue after an unnecessary queue, e.g if the process was able to acquire the lock after it added itself to the
+waiting queue (with LWLockQueueSelf()) without actually waiting/sleeping.
+1. The lock's wait list is locked with LWLockWaitListLock() - This sets the LW_FLAG_LOCKED flag on lock->state
+2. If the process is on the wait list, ie MyProc->lwWaiting == LW_WS_WAITING, the process is deleted from the lock->waiters proclist
+with proclist_delete
+3. If after the deletion, the lock->waiters proclist becomes empty and the LW_FLAG_HAS_WAITERS is set, the LW_FLAG_HAS_WAITERS flag is unset atomically
+4.The lock's wait list is unlocked with  LWLockWaitListUnLock()
+5. If the process was on the wait list, it sets MyProc->lwWaiting to LW_WS_NOT_WAITING and the dequeue is done!
+6 else if the process wasn't on the waitlist (i.e MyProc->lwWaiting !=  LW_WS_WAITING) it means it has already been removed from the wait list by a wakeup operation
+and is pending actual wakeup so it goes to sleep with PGSemaphoreLock(MyProc->sem). When woken up, it checks if the wakeup is due to a lock release
+by checking if MyProc->lwWaiting ==  LW_WS_WAITING, if yes the dequeue is done, else it goes to sleep in a loop until the wakeup is due to a lock's release.

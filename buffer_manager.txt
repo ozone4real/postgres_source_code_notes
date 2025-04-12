@@ -1,0 +1,68 @@
+### Buffer manager
+
+
+BufferTag;
+{
+	RelFileNode rnode; /* physical relation identifier. This is the name of the relation file */
+	ForkNumber forkNum;
+	BlockNumber blockNum; /* blknum relative to begin of reln */
+} 
+
+BufferDesc
+{
+	BufferTag tag; /* ID of page contained in buffer */
+	int buf_id;		 /* buffer's index number (from 0) */
+
+	/* state of the tag, containing flags, refcount and usagecount */
+	pg_atomic_uint32 state;
+
+	int wait_backend_pid; /* backend PID of pin-count waiter */
+	int freeNext;					/* link in freelist chain */
+	LWLock content_lock;	/* to lock access to buffer contents */
+} BufferDesc;
+
+
+Layout of Buffer manager
+Buffer table: A hash table of buffer tags as keys and buffer ids as values
+Buffer pool: An array that stores data file pages. Each index in the array is referred to as buffer_ids.
+Buffer descriptors: An array of buffer descriptors. Each descriptor has a one-to-one correspondence to a buffer pool slot and holds the metadata of the stored page in the corresponding slot.
+How a buffer page is accessed:
+- Backend requests for the buffer page associated with a BufferTag from the Buffer manager
+- The buffer manager checks the buffer table for the buffer id associated with the tag
+- If the tag is missing, the buffer manager selects an empty buffer descriptor (BufferDesc) from the free list chain
+- The Buffer Desc maps to a page in the buffer pool, so it has the index of the page (buf_id). the buffer descriptor
+is updated with the buffer tag and the buffer table is updated with an entry for the new BufferTag and buf_id
+- The page is retrieved from disk using the BufferTag info (i.e BlockNumber for the page and RelfileNode for the file associated with the relation)
+- The retrieved page is added to the buffer pool array at the index corresponding to the buffer id
+- The buffer descriptor is updated with metadata about the page (see BufferDesc struct above).
+
+
+ref_count: no of processes currently accessing the page
+usage_count: No of times the page has ben accessed since it was loaded in the buffer pool. Used in the page replacement algorithm
+
+### Page replacement algo
+If the buffer pool is filled up and a backend requests for a page that isn't in the pool, the page has to be read from disk and replace
+a page in the pool.
+- Backend requests page with Buffer tag
+- Buffer manager looks up tag in buffer hash table but the tag is missing.
+- Buffer manager selects a page for eviction using the clock sweep algorithm
+- The buffer desc of the evictee is pinned
+- The content_lock of the buffer desc is acquired and the io_in_progress flag is set on the state atomically.
+- The evictee page is flushed to disk.
+- The content_lock is released and the io_in_progress flag is cleared
+- A BufferMappingLock is acquired for the partition the old evictee entry belong to.
+- The buffer creates an entry with the new page's tag and the evictee buffer id.
+- A BufferMappingLock is acquired for the partition the new entry will be inserted to.
+- The new entry is inserted into the table.
+- The evictee entry is removed.
+- The BufferMappingLock for evictee is released.
+- The new page is read from disk into the now empty buffer pool slot.
+- The buffer desc metadata is updated
+
+Visibility map
+The relfilenode file is suffixed with _vm
+Th VM like tables is segemented into pages (8kb)
+Most times just 1 VM page is enough to store all the Visibility for a table
+The VM data is stored after the page header, it's a bitmap. The page header is 24bytes.
+The visibility of each page is stored in 2 bits. So if a page is all visible,
+the bits is 01, if the page isn't all visible the bits is 00.
