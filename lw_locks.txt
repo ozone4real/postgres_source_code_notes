@@ -1,6 +1,6 @@
 ### LW LOCKS
 
-Light weight lock is the main mutual exclusion mechanism used by Postgres. It has lesser resource utilization compared to spinlocks.
+Light weight lock is a mutual exclusion mechanism used by Postgres. It has lesser resource utilization compared to spinlocks.
 Processes that attempt to acquire a LWLock go to sleep (via a POSIX semaphore) if they fail to acquire it (i.e if the LWLock is held by another process in a conflicting mode).
 The process holding the LW lock wakes up waiting processes when it releases the lock so they can reattempt acquiring the lock. This is in contrast
 to spin locks where processes spin (loop) continuously (with a small spin delay) until they acquire the lock.
